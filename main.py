@@ -57,7 +57,7 @@ WAITING_FOR_COUPONS = 1
 
 # --- DATABASE CONNECTION ---
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-db = client['shein_bot_db']
+db = client['shein_bot_db_2']
 users_col = db['users']
 coupons_col = db['coupons']
 redeemed_col = db['redeemed']
