@@ -43,15 +43,14 @@ except ValueError:
     FSUB_CHANNEL_IDS = []
 
 # --- 💎 WITHDRAWAL CONFIG 💎 ---
-COUPON_COSTS = {500: 1, 1000: 4, 2000: 25, 4000: 35}
+COUPON_COSTS = {500: 2, 1000: 6, 2000: 20, 4000: 35}
 
-# --- 🎨 COLORFUL BUTTONS CONFIG (Simulated with Emojis) ---
-# Red = Danger/Fire
-BTN_LINK = "❤️ 𝗠𝘆 𝗟𝗶𝗻𝗸"
-# Blue = Primary/Gem
-BTN_BALANCE = "💎 𝗕𝗮𝗹𝗮𝗻𝗰𝗲"
-# Green = Success/Go
-BTN_WITHDRAW = "❇️ 𝗪𝗶𝘁𝗵𝗱𝗿𝗮𝘄"
+# --- 🎨 COLORFUL BUTTON CONFIG ---
+# Using 3D/Color Emojis to make them pop since background color is theme-dependent
+BTN_LINK = "❤️ 𝗠𝘆 𝗟𝗶𝗻𝗸"      # Red Heart
+BTN_BALANCE = "💠 𝗕𝗮𝗹𝗮𝗻𝗰𝗲"   # Blue Diamond
+BTN_WITHDRAW = "❇️ 𝗪𝗶𝘁𝗵𝗱𝗿𝗮𝘄" # Green Signal
+# Stock button removed for users
 
 # States for Admin Conversation
 WAITING_FOR_COUPONS = 1
@@ -138,13 +137,15 @@ async def get_stats():
 
 async def add_coupons_to_db(codes, amount, admin_id):
     added_count = 0
-    # Duplicates are now ALLOWED. No duplicate check here.
+    # duplicates = 0  <-- Removed logic for rejecting duplicates
     
     for code in codes:
         code = code.strip()
         if not code: continue
         
-        # Directly insert without checking if it exists
+        # REMOVED CHECK: exists = await coupons_col.find_one({'code': code})
+        # We now allow duplicates. If you add the same code twice, it counts as 2 items.
+            
         await coupons_col.insert_one({
             'code': code,
             'amount': amount,
@@ -162,7 +163,7 @@ async def add_coupons_to_db(codes, amount, admin_id):
         'timestamp': datetime.datetime.now()
     })
     
-    return added_count
+    return added_count # Returns count added
 
 async def delete_coupons_from_db(codes, admin_id):
     result = await coupons_col.delete_many({'code': {'$in': codes}})
@@ -180,7 +181,8 @@ async def process_redemption(user_id, cost, amount):
     if not user or user['balance'] < cost:
         return None, "insufficient_balance"
     
-    # Finds the first available coupon. Duplicates are handled naturally (FIFO).
+    # Finds the *first available* coupon with this amount.
+    # Since we allow duplicates now, this works perfectly (it just takes the next one).
     coupon = await coupons_col.find_one_and_update(
         {'amount': amount, 'is_used': False},
         {'$set': {'is_used': True, 'used_by': user_id, 'used_at': datetime.datetime.now()}}
@@ -310,12 +312,12 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("❌ You haven't joined all channels yet!", show_alert=True)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 🎨 BUTTONS CONFIGURATION
-    # Coupon Stock is HIDDEN for normal users (Not added to keyboard)
+    # 🎨 EYE CATCHING BUTTON LAYOUT (Stock Hidden)
     keyboard = [
         [KeyboardButton(BTN_LINK), KeyboardButton(BTN_BALANCE)],
         [KeyboardButton(BTN_WITHDRAW)]
     ]
+    # is_persistent=True keeps the menu visible (better UX)
     markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
     
     text = (
@@ -366,8 +368,9 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# Stock handler - ONLY ACCESSIBLE BY ADMINS via Command (Hidden from buttons)
+# This handler still exists but is restricted to admins or not shown in buttons
 async def stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Hidden from regular users completely
     if update.effective_user.id not in ADMIN_IDS: return
 
     stats = await get_stats()
@@ -403,8 +406,8 @@ async def withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     keyboard = [
-        [InlineKeyboardButton("1 💎 = 500 🎟", callback_data="redeem_500"), InlineKeyboardButton("4 💎 = 1000 🎟", callback_data="redeem_1000")],
-        [InlineKeyboardButton("25 💎 = 2000 🎟", callback_data="redeem_2000"), InlineKeyboardButton("35 💎 = 4000 🎟", callback_data="redeem_4000")],
+        [InlineKeyboardButton("2 💎 = 500 🎟", callback_data="redeem_500"), InlineKeyboardButton("6 💎 = 1000 🎟", callback_data="redeem_1000")],
+        [InlineKeyboardButton("20 💎 = 2000 🎟", callback_data="redeem_2000"), InlineKeyboardButton("35 💎 = 4000 🎟", callback_data="redeem_4000")],
         [InlineKeyboardButton("🔙 Back", callback_data="close_withdraw")]
     ]
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -544,8 +547,7 @@ async def process_add_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE
     admin_id = update.effective_user.id
     if not amount: return ConversationHandler.END
     codes = text.splitlines()
-    
-    # ADDED WITHOUT DUPLICATE CHECK
+    # Called with NO duplicate check now
     added = await add_coupons_to_db(codes, amount, admin_id)
     
     reply_text = (
@@ -596,9 +598,10 @@ def main():
     application.add_handler(CommandHandler("delete", delete_coupons_command))
     application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
     
-    # Button Text Handlers (Updated colors)
+    # Text Handlers (Updated with Colorful Buttons)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LINK}$"), my_link_handler))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_BALANCE}$"), balance_handler))
+    # Removed BTN_STOCK regex since button is hidden
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_WITHDRAW}$"), withdraw_handler))
     
     application.add_handler(conv_handler)
@@ -606,7 +609,7 @@ def main():
     application.add_handler(CallbackQueryHandler(redeem_callback, pattern="^redeem_"))
     application.add_handler(CallbackQueryHandler(redeem_callback, pattern="^close_withdraw"))
     
-    print("Bot is polling (Colorful & Optimized 🚀)...")
+    print("Bot is polling (Colorful, No Stock for Users, Duplicates Allowed 🚀)...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
