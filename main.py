@@ -250,7 +250,7 @@ async def validate_user_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE)
             chat = await context.bot.get_chat(ch_id)
             link = chat.invite_link or f"https://t.me/c/{str(ch_id)[4:]}/1"
         except:
-            link = "#"
+            link = ""
         buttons.append([InlineKeyboardButton(f"📢 Join Channel {i}", url=link)])
     
     buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
