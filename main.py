@@ -5,9 +5,13 @@ import threading
 import time
 from dotenv import load_dotenv
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 import motor.motor_asyncio
 
 # --- CONFIGURATION ---
@@ -46,14 +50,13 @@ except ValueError:
 COUPON_COSTS = {500: 2, 1000: 6, 2000: 20, 4000: 35}
 
 # --- 🎨 COLORFUL BUTTON CONFIG ---
-# Using 3D/Color Emojis to make them pop since background color is theme-dependent
 BTN_LINK = "❤️ 𝗠𝘆 𝗟𝗶𝗻𝗸"      # Red Heart
 BTN_BALANCE = "💠 𝗕𝗮𝗹𝗮𝗻𝗰𝗲"   # Blue Diamond
 BTN_WITHDRAW = "❇️ 𝗪𝗶𝘁𝗵𝗱𝗿𝗮𝘄" # Green Signal
-# Stock button removed for users
 
 # States for Admin Conversation
-WAITING_FOR_COUPONS = 1
+class AdminStates(StatesGroup):
+    WAITING_FOR_COUPONS = State()
 
 # --- DATABASE CONNECTION ---
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
@@ -137,14 +140,10 @@ async def get_stats():
 
 async def add_coupons_to_db(codes, amount, admin_id):
     added_count = 0
-    # duplicates = 0  <-- Removed logic for rejecting duplicates
     
     for code in codes:
         code = code.strip()
         if not code: continue
-        
-        # REMOVED CHECK: exists = await coupons_col.find_one({'code': code})
-        # We now allow duplicates. If you add the same code twice, it counts as 2 items.
             
         await coupons_col.insert_one({
             'code': code,
@@ -163,7 +162,7 @@ async def add_coupons_to_db(codes, amount, admin_id):
         'timestamp': datetime.datetime.now()
     })
     
-    return added_count # Returns count added
+    return added_count
 
 async def delete_coupons_from_db(codes, admin_id):
     result = await coupons_col.delete_many({'code': {'$in': codes}})
@@ -181,8 +180,6 @@ async def process_redemption(user_id, cost, amount):
     if not user or user['balance'] < cost:
         return None, "insufficient_balance"
     
-    # Finds the *first available* coupon with this amount.
-    # Since we allow duplicates now, this works perfectly (it just takes the next one).
     coupon = await coupons_col.find_one_and_update(
         {'amount': amount, 'is_used': False},
         {'$set': {'is_used': True, 'used_by': user_id, 'used_at': datetime.datetime.now()}}
@@ -227,8 +224,8 @@ async def is_member(user_id, bot):
             return False
     return True
 
-async def validate_user_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+async def validate_user_fsub(message_or_query, bot):
+    user = message_or_query.from_user
     current_time = time.time()
     
     # Check Cache
@@ -237,7 +234,7 @@ async def validate_user_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return True
         
     # Check API
-    is_sub = await is_member(user.id, context.bot)
+    is_sub = await is_member(user.id, bot)
     
     if is_sub:
         user_fsub_cache[user.id] = current_time 
@@ -247,7 +244,7 @@ async def validate_user_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE)
     buttons = []
     for i, ch_id in enumerate(FSUB_CHANNEL_IDS, 1):
         try:
-            chat = await context.bot.get_chat(ch_id)
+            chat = await bot.get_chat(ch_id)
             link = chat.invite_link or f"https://t.me/c/{str(ch_id)[4:]}/1"
         except:
             link = ""
@@ -261,28 +258,28 @@ async def validate_user_fsub(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Please join back to continue:"
     )
     
-    if update.callback_query:
-        await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+    if isinstance(message_or_query, types.CallbackQuery):
+        await message_or_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+        await message_or_query.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
         
     return False
 
 # --- HANDLERS ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    args = context.args
+async def start(message: types.Message, command: CommandObject, state: FSMContext, bot: Bot):
+    user = message.from_user
+    args = command.args
     referrer_id = None
     
-    if args and args[0].isdigit():
-        possible_referrer = int(args[0])
-        if possible_referrer != user.id:
-            referrer_id = possible_referrer
+    if args and args.split():
+        possible_referrer = args.split()[0]
+        if possible_referrer.isdigit() and int(possible_referrer) != user.id:
+            referrer_id = int(possible_referrer)
 
-    if not await validate_user_fsub(update, context):
+    if not await validate_user_fsub(message, bot):
         if referrer_id:
-            context.user_data['referrer_id'] = referrer_id
+            await state.update_data(referrer_id=referrer_id)
         return
 
     is_new = await add_user(user, referrer_id)
@@ -291,51 +288,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_new and db_user.get('referred_by'):
         await update_referral_reward(db_user['referred_by'])
 
-    await show_main_menu(update, context)
+    await show_main_menu(message, bot)
 
-async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    await query.answer()
+async def check_join_callback(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    user = callback.from_user
+    await callback.answer()
 
-    is_sub = await is_member(user.id, context.bot)
+    is_sub = await is_member(user.id, bot)
     
     if is_sub:
         user_fsub_cache[user.id] = time.time()
-        referrer_id = context.user_data.get('referrer_id')
+        data = await state.get_data()
+        referrer_id = data.get('referrer_id')
         is_new = await add_user(user, referrer_id)
         if is_new and referrer_id:
             await update_referral_reward(referrer_id)
-        await query.message.delete()
-        await show_main_menu(update, context)
+        await callback.message.delete()
+        await show_main_menu(callback, bot)
     else:
-        await query.answer("❌ You haven't joined all channels yet!", show_alert=True)
+        await callback.answer("❌ You haven't joined all channels yet!", show_alert=True)
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_main_menu(message_or_query, bot):
     # 🎨 EYE CATCHING BUTTON LAYOUT (Stock Hidden)
     keyboard = [
-        [KeyboardButton(BTN_LINK), KeyboardButton(BTN_BALANCE)],
-        [KeyboardButton(BTN_WITHDRAW)]
+        [KeyboardButton(text=BTN_LINK), KeyboardButton(text=BTN_BALANCE)],
+        [KeyboardButton(text=BTN_WITHDRAW)]
     ]
-    # is_persistent=True keeps the menu visible (better UX)
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+    markup = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, is_persistent=True)
     
     text = (
-        f"👋 Welcome {update.effective_user.first_name}!\n\n"
+        f"👋 Welcome {message_or_query.from_user.first_name}!\n\n"
         "Earn free SHEIN coupons by inviting friends.\n"
         "Choose an option below:"
     )
     
-    if update.message:
-        await update.message.reply_text(text, reply_markup=markup)
+    if isinstance(message_or_query, types.Message):
+        await message_or_query.reply_text(text, reply_markup=markup)
     else:
-        await update.callback_query.message.reply_text(text, reply_markup=markup)
+        await message_or_query.message.reply_text(text, reply_markup=markup)
 
-async def my_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await validate_user_fsub(update, context): return
+async def my_link_handler(message: types.Message, bot: Bot):
+    if not await validate_user_fsub(message, bot): return
     
-    user = update.effective_user
-    bot_username = context.bot.username
+    user = message.from_user
+    bot_username = (await bot.get_me()).username
     ref_link = f"https://t.me/{bot_username}?start={user.id}"
     
     text = (
@@ -346,13 +342,13 @@ async def my_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>Share this link to start earning!</i>"
     )
     
-    buttons = [[InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={ref_link}&text=Get%20Free%20Shein%20Coupons!")]]
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+    buttons = [[InlineKeyboardButton(text="📤 Share Link", url=f"https://t.me/share/url?url={ref_link}&text=Get%20Free%20Shein%20Coupons!", style="success")]]
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await validate_user_fsub(update, context): return
+async def balance_handler(message: types.Message, bot: Bot):
+    if not await validate_user_fsub(message, bot): return
 
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     user_data = await get_user(user_id)
     
     balance = user_data.get('balance', 0.0)
@@ -366,12 +362,11 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Redeem:</b> {redeemed_count}\n\n"
         f"<i>Redeem History:</i>{history_text}"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# This handler still exists but is restricted to admins or not shown in buttons
-async def stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stock_handler(message: types.Message, bot: Bot):
     # Hidden from regular users completely
-    if update.effective_user.id not in ADMIN_IDS: return
+    if message.from_user.id not in ADMIN_IDS: return
 
     stats = await get_stats()
     stock = stats['stock']
@@ -382,17 +377,17 @@ async def stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 2000 Coupons: {stock.get(2000, 0)}\n"
         f"• 4000 Coupons: {stock.get(4000, 0)}"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await validate_user_fsub(update, context): return
+async def withdraw_handler(message: types.Message, bot: Bot):
+    if not await validate_user_fsub(message, bot): return
 
-    user_id = update.effective_user.id
+    user_id = message.from_user.id
     user_data = await get_user(user_id)
     balance = user_data.get('balance', 0.0)
     
     if balance <= 0:
-        await update.message.reply_text(
+        await message.reply_text(
             f"❌ Insufficient Balance!\n\n"
             f"Your balance is {balance} 💎\n"
             f"Invite friends to earn more coins."
@@ -406,23 +401,22 @@ async def withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     keyboard = [
-        [InlineKeyboardButton("2 💎 = 500 🎟", callback_data="redeem_500"), InlineKeyboardButton("6 💎 = 1000 🎟", callback_data="redeem_1000")],
-        [InlineKeyboardButton("20 💎 = 2000 🎟", callback_data="redeem_2000"), InlineKeyboardButton("35 💎 = 4000 🎟", callback_data="redeem_4000")],
-        [InlineKeyboardButton("🔙 Back", callback_data="close_withdraw")]
+        [InlineKeyboardButton(text="2 💎 = 500 🎟", callback_data="redeem_500"), InlineKeyboardButton(text="6 💎 = 1000 🎟", callback_data="redeem_1000")],
+        [InlineKeyboardButton(text="20 💎 = 2000 🎟", callback_data="redeem_2000"), InlineKeyboardButton(text="35 💎 = 4000 🎟", callback_data="redeem_4000")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="close_withdraw")]
     ]
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
-async def redeem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not await validate_user_fsub(update, context): 
-        await query.answer()
+async def redeem_callback(callback: types.CallbackQuery, bot: Bot):
+    if not await validate_user_fsub(callback, bot): 
+        await callback.answer()
         return
 
-    user = query.from_user
-    data = query.data
+    user = callback.from_user
+    data = callback.data
     
     if data == "close_withdraw":
-        await query.message.delete()
+        await callback.message.delete()
         return
         
     amount = int(data.split("_")[1])
@@ -433,7 +427,7 @@ async def redeem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status == "success":
         user_data = await get_user(user.id)
         balance = user_data.get('balance', 0.0)
-        await query.message.edit_text(
+        await callback.message.edit_text(
             f"✅ Coupon Redeemed Successfully!\n\n"
             f"🎟 Code: <code>{code}</code>\n"
             f"💰 Amount: {amount} 🎟\n"
@@ -443,7 +437,7 @@ async def redeem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         if LOG_CHANNEL_ID:
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=LOG_CHANNEL_ID,
                 text=f"🎟 New Redemption\n\n"
                      f"👤 User: {user.first_name} (ID: {user.id})\n"
@@ -452,10 +446,10 @@ async def redeem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"🕒 Time: {datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
             )
     elif status == "out_of_stock":
-        await query.answer(f"❌ {amount} 🎟 coupons are out of stock!", show_alert=True)
+        await callback.answer(f"❌ {amount} 🎟 coupons are out of stock!", show_alert=True)
     elif status == "insufficient_balance":
         user_data = await get_user(user.id)
-        await query.message.edit_text(
+        await callback.message.edit_text(
             f"❌ Insufficient Balance!\n\n"
             f"Required: {cost} 💎\n"
             f"Your balance: {user_data.get('balance', 0)} 💎\n\n"
@@ -464,26 +458,26 @@ async def redeem_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ADMIN COMMANDS ---
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    await show_admin_panel(update, context)
+async def admin_command(message: types.Message, bot: Bot):
+    if message.from_user.id not in ADMIN_IDS: return
+    await show_admin_panel(message, bot)
 
-async def delete_coupons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def delete_coupons_command(message: types.Message, command: CommandObject, bot: Bot):
+    user_id = message.from_user.id
     if user_id not in ADMIN_IDS: return
 
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: `/delete CODE1 CODE2 ...`", parse_mode=ParseMode.MARKDOWN)
+    if not command.args:
+        await message.reply_text("❌ Usage: `/delete CODE1 CODE2 ...`", parse_mode=ParseMode.MARKDOWN)
         return
 
+    args = command.args.split()
     count = await delete_coupons_from_db(args, user_id)
     if count > 0:
-        await update.message.reply_text(f"✅ Successfully deleted {count} coupon(s)!")
+        await message.reply_text(f"✅ Successfully deleted {count} coupon(s)!")
     else:
-        await update.message.reply_text("⚠️ No coupons found with those codes.")
+        await message.reply_text("⚠️ No coupons found with those codes.")
 
-async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_admin_panel(message_or_callback, bot):
     stats = await get_stats()
     text = (
         f"👑 Admin Panel\n\n"
@@ -495,25 +489,24 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Select an option:"
     )
     keyboard = [
-        [InlineKeyboardButton("➕ Add 500 Coupons", callback_data="add_c_500"), InlineKeyboardButton("➕ Add 1000 Coupons", callback_data="add_c_1000")],
-        [InlineKeyboardButton("➕ Add 2000 Coupons", callback_data="add_c_2000"), InlineKeyboardButton("➕ Add 4000 Coupons", callback_data="add_c_4000")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"), InlineKeyboardButton("🔄 Reload Data", callback_data="admin_reload")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="admin_close")]
+        [InlineKeyboardButton(text="➕ Add 500 Coupons", callback_data="add_c_500"), InlineKeyboardButton(text="➕ Add 1000 Coupons", callback_data="add_c_1000")],
+        [InlineKeyboardButton(text="➕ Add 2000 Coupons", callback_data="add_c_2000"), InlineKeyboardButton(text="➕ Add 4000 Coupons", callback_data="add_c_4000")],
+        [InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats"), InlineKeyboardButton(text="🔄 Reload Data", callback_data="admin_reload")],
+        [InlineKeyboardButton(text="🔙 Back to Main", callback_data="admin_close")]
     ]
-    if update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await message_or_callback.reply_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
+async def admin_callback(callback: types.CallbackQuery, state: FSMContext, bot: Bot):
+    data = callback.data
     
     if data == "admin_close":
-        await query.message.delete()
+        await callback.message.delete()
         return
     if data == "admin_reload":
-        await show_admin_panel(update, context)
+        await show_admin_panel(callback, bot)
         return
     if data == "admin_stats":
         stats = await get_stats()
@@ -531,23 +524,27 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• 4000 🎟: {stats['stock'].get(4000, 0)}\n\n"
             f"Last updated: {datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
-        keyboard = [[InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="admin_reload")]]
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        keyboard = [[InlineKeyboardButton(text="🔙 Back to Admin Panel", callback_data="admin_reload")]]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
         return
 
     if data.startswith("add_c_"):
         amount = int(data.split("_")[2])
-        context.user_data['add_coupon_amount'] = amount
-        await query.message.reply_text(f"Please send coupon codes for {amount} 🎟 (one per line):")
-        return WAITING_FOR_COUPONS
+        await state.update_data(add_coupon_amount=amount)
+        await callback.message.reply_text(f"Please send coupon codes for {amount} 🎟 (one per line):")
+        await state.set_state(AdminStates.WAITING_FOR_COUPONS)
+        await callback.answer()
 
-async def process_add_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    amount = context.user_data.get('add_coupon_amount')
-    admin_id = update.effective_user.id
-    if not amount: return ConversationHandler.END
+async def process_add_coupons(message: types.Message, state: FSMContext, bot: Bot):
+    text = message.text
+    data = await state.get_data()
+    amount = data.get('add_coupon_amount')
+    admin_id = message.from_user.id
+    if not amount: 
+        await state.clear()
+        return
+    
     codes = text.splitlines()
-    # Called with NO duplicate check now
     added = await add_coupons_to_db(codes, amount, admin_id)
     
     reply_text = (
@@ -555,23 +552,23 @@ async def process_add_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"💰 Amount: {amount} 🎟\n"
         f"🎟 Added: {added} codes"
     )
-    await update.message.reply_text(reply_text)
+    await message.reply_text(reply_text)
     if LOG_CHANNEL_ID:
-        await context.bot.send_message(
+        await bot.send_message(
             chat_id=LOG_CHANNEL_ID,
             text=f"👑 Admin Action\n\n"
-                 f"👤 Admin: {update.effective_user.first_name} (ID: {admin_id})\n"
+                 f"👤 Admin: {message.from_user.first_name} (ID: {admin_id})\n"
                  f"🎟 Added: {added} x {amount} 🎟 coupons\n"
                  f"🕒 Time: {datetime.datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
-    return ConversationHandler.END
+    await state.clear()
 
-async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Action cancelled.")
-    return ConversationHandler.END
+async def cancel_add(message: types.Message, state: FSMContext):
+    await message.reply_text("Action cancelled.")
+    await state.clear()
 
 # --- MAIN EXECUTION ---
-def main():
+async def main():
     global bot_instance
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found in environment variables!")
@@ -583,34 +580,34 @@ def main():
     flask_thread.start()
     print("Flask Server running in background...")
 
-    # Start Bot
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_instance = application.bot
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_callback, pattern="^add_c_")],
-        states={WAITING_FOR_COUPONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_add_coupons)]},
-        fallbacks=[CommandHandler('cancel', cancel_add)]
-    )
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("delete", delete_coupons_command))
-    application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
+    # Initialize Bot and Dispatcher
+    bot = Bot(token=BOT_TOKEN)
+    bot_instance = bot
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    # Register handlers
+    dp.message.register(start, Command("start"))
+    dp.message.register(admin_command, Command("admin"))
+    dp.message.register(delete_coupons_command, Command("delete"))
+    dp.callback_query.register(check_join_callback, lambda c: c.data == "check_join")
     
     # Text Handlers (Updated with Colorful Buttons)
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LINK}$"), my_link_handler))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_BALANCE}$"), balance_handler))
-    # Removed BTN_STOCK regex since button is hidden
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_WITHDRAW}$"), withdraw_handler))
+    dp.message.register(my_link_handler, lambda m: m.text == BTN_LINK)
+    dp.message.register(balance_handler, lambda m: m.text == BTN_BALANCE)
+    dp.message.register(withdraw_handler, lambda m: m.text == BTN_WITHDRAW)
     
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
-    application.add_handler(CallbackQueryHandler(redeem_callback, pattern="^redeem_"))
-    application.add_handler(CallbackQueryHandler(redeem_callback, pattern="^close_withdraw"))
+    # Conversation handler for admin adding coupons
+    dp.message.register(process_add_coupons, AdminStates.WAITING_FOR_COUPONS, lambda m: m.text and not m.text.startswith('/'))
+    dp.message.register(cancel_add, Command("cancel"), AdminStates.WAITING_FOR_COUPONS)
+    
+    # Callback handlers
+    dp.callback_query.register(admin_callback, lambda c: c.data.startswith(("admin_", "add_c_")))
+    dp.callback_query.register(redeem_callback, lambda c: c.data.startswith(("redeem_", "close_withdraw")))
     
     print("Bot is polling (Colorful, No Stock for Users, Duplicates Allowed 🚀)...")
-    application.run_polling(drop_pending_updates=True)
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
