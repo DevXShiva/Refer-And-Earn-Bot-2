@@ -1,17 +1,23 @@
 FROM python:3.10-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 
-ENV PYTHONUNBUFFERED=1
-
 WORKDIR /app
 
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (for better caching)
 COPY requirements.txt .
+
+# Upgrade pip first
+RUN pip install --upgrade pip
+
+# Install dependencies with no cache
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy application
 COPY . .
 
-# Render expects the app to listen on the port defined by $PORT
-# We default to 8080 in the python script if not set
-EXPOSE 8080
-
+# Run bot
 CMD ["python", "main.py"]
