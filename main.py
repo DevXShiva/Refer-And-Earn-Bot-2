@@ -338,7 +338,7 @@ async def my_link_handler(message: Message, bot: Bot):
     )
     
     builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="📤 Share Link", url=f"https://t.me/share/url?url={ref_link}&text=Get%20Free%20Shein%20Coupons!"))
+    builder.add(InlineKeyboardButton(text="📤 Share Link", url=f"https://t.me/share/url?url={ref_link}&text=Get%20Free%20Shein%20Coupons!", style="success"))
     
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
 
